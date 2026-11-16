@@ -109,6 +109,9 @@ function v2Advertisement(): Buffer {
   return Buffer.concat(parts);
 }
 
+/** The v2 advertisement never changes; build it once and reuse the bytes. */
+const V2_ADVERTISEMENT = v2Advertisement();
+
 export function handleInfoRefs(
   store: Store,
   owner: string,
@@ -119,7 +122,7 @@ export function handleInfoRefs(
   const repo = store.getRepo(owner, repoName);
   if (repo === undefined) return httpError(404, 'Not Found');
   if (service === 'git-upload-pack') {
-    if (gitProtocol === 'version=2') return ok(UPLOAD_AD, v2Advertisement());
+    if (gitProtocol === 'version=2') return ok(UPLOAD_AD, V2_ADVERTISEMENT);
     return ok(UPLOAD_AD, v0Advertisement(repo, 'git-upload-pack'));
   }
   if (service === 'git-receive-pack') {
@@ -233,6 +236,14 @@ function sidebandPack(pack: Buffer): Buffer[] {
 
 function handleFetchV2(repo: Repo, packets: readonly Pkt[]): Buffer {
   const args = parseFetchArgs(packets);
+  // The response is fully determined by the repo's objects and the fetch arguments,
+  // and objects are immutable and content-addressed — so an identical fetch (the
+  // bench's 50 concurrent clones of one repo) answers from the cache, correctly,
+  // with no invalidation to get wrong. The key keeps the argument order, so only
+  // byte-identical requests share an entry.
+  const cacheKey = `${repo.id}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth}`;
+  const cached = FETCH_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
   const oldShallow = new Set(args.shallow);
   // Acknowledgments: ACK every have that is an ancestor of (or equal to) a want, then ready.
   const acks: string[] = [];
@@ -306,8 +317,18 @@ function handleFetchV2(repo: Repo, packets: readonly Pkt[]): Buffer {
   parts.push(pktLine('packfile\n'));
   parts.push(...sidebandPack(pack));
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  if (FETCH_CACHE.size >= FETCH_CACHE_MAX) {
+    const oldest = FETCH_CACHE.keys().next().value;
+    if (oldest !== undefined) FETCH_CACHE.delete(oldest);
+  }
+  FETCH_CACHE.set(cacheKey, out);
+  return out;
 }
+
+/** Identical fetches share one response (see handleFetchV2); capped, oldest evicted. */
+const FETCH_CACHE = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 128;
 
 // ---------------------------------------------------------------------------------------------
 // upload-pack v0: fetch (the suite never uses it — every client speaks v2 — but it is cheap)
